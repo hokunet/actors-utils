@@ -7,7 +7,7 @@ use cid::Cid;
 use fvm_actor_utils::receiver::ReceiverHookError;
 use fvm_ipld_amt::Amt;
 use fvm_ipld_amt::Error as AmtError;
-use fvm_ipld_bitfield::BitField;
+use fvm_ipld_bitfield::{BitField, MaybeBitField};
 use fvm_ipld_blockstore::Block;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
@@ -600,6 +600,26 @@ impl NFTState {
         Ok(token.owner)
     }
 
+    fn list_tokens_inner<BS: Blockstore>(
+        &self,
+        bs: &BS,
+        cursor: Option<Cursor>,
+        limit: u64,
+        filter: impl Fn(&TokenData) -> bool,
+    ) -> Result<(TokenSet, Option<Cursor>)> {
+        let token_data_array = self.get_token_amt_for_cursor(bs, &cursor)?;
+        let mut iter = token_data_array
+            .iter_from(cursor.map(|r| r.index).unwrap_or(0))?
+            .filter_map(|kv| kv.map(|(i, data)| filter(data).then_some(i)).transpose());
+        let token_ids = iter
+            .by_ref()
+            .take(limit as usize)
+            .collect::<std::result::Result<MaybeBitField, _>>()?
+            .try_into()
+            .unwrap();
+        Ok((token_ids, iter.next().transpose()?.map(|key| Cursor::new(self.token_data, key))))
+    }
+
     /// List all the minted tokens.
     pub fn list_tokens<BS: Blockstore>(
         &self,
@@ -607,17 +627,7 @@ impl NFTState {
         cursor: Option<Cursor>,
         limit: u64,
     ) -> Result<(TokenSet, Option<Cursor>)> {
-        let token_data_array = self.get_token_amt_for_cursor(bs, &cursor)?;
-        // Build the TokenSet
-        let mut token_ids = TokenSet::new();
-        let (_, next_key) =
-            token_data_array.for_each_ranged(cursor.map(|r| r.index), Some(limit), |i, _| {
-                token_ids.set(i);
-                Ok(())
-            })?;
-
-        let next_cursor = next_key.map(|key| Cursor::new(self.token_data, key));
-        Ok((token_ids, next_cursor))
+        self.list_tokens_inner(bs, cursor, limit, |_| true)
     }
 
     /// List the tokens owned by an actor. In the reference implementation this is may be a
@@ -630,20 +640,7 @@ impl NFTState {
         cursor: Option<Cursor>,
         limit: u64,
     ) -> Result<(TokenSet, Option<Cursor>)> {
-        let token_data_array = self.get_token_amt_for_cursor(bs, &cursor)?;
-
-        // Build the TokenSet
-        let mut token_ids = TokenSet::new();
-        let (_, next_key) =
-            token_data_array.for_each_ranged(cursor.map(|r| r.index), Some(limit), |i, data| {
-                if data.owner == owner {
-                    token_ids.set(i);
-                }
-                Ok(())
-            })?;
-
-        let next_cursor = next_key.map(|key| Cursor::new(self.token_data, key));
-        Ok((token_ids, next_cursor))
+        self.list_tokens_inner(bs, cursor, limit, |data| data.owner == owner)
     }
 
     /// List all the token operators for a given `token_id`.
@@ -682,20 +679,7 @@ impl NFTState {
         cursor: Option<Cursor>,
         limit: u64,
     ) -> Result<(TokenSet, Option<Cursor>)> {
-        let token_data_array = self.get_token_amt_for_cursor(bs, &cursor)?;
-
-        // Build the TokenSet
-        let mut operatable_tokens = TokenSet::new();
-        let (_, next_key) =
-            token_data_array.for_each_ranged(cursor.map(|r| r.index), Some(limit), |i, data| {
-                if data.operators.get(operator) {
-                    operatable_tokens.set(i);
-                }
-                Ok(())
-            })?;
-
-        let next_cursor = next_key.map(|key| Cursor::new(self.token_data, key));
-        Ok((operatable_tokens, next_cursor))
+        self.list_tokens_inner(bs, cursor, limit, |data| data.operators.get(operator))
     }
 
     /// List all the token operators for a given account.
@@ -821,17 +805,14 @@ impl NFTState {
         let mut counted_balances = HashMap::<ActorID, u64>::new();
 
         let mut token_map = HashMap::<TokenID, TokenData>::new();
-        token_data
-            .for_each(|id, data| {
-                // tally owner of token
-                let owner = data.owner;
-                let count = counted_balances.entry(owner).or_insert(0);
-                *count += 1;
+        for (id, data) in token_data.iter().map(|kv| kv.unwrap()) {
+            // tally owner of token
+            let owner = data.owner;
+            let count = counted_balances.entry(owner).or_insert(0);
+            *count += 1;
 
-                token_map.insert(id, data.clone());
-                Ok(())
-            })
-            .unwrap();
+            token_map.insert(id, data.clone());
+        }
 
         let mut owner_map = HashMap::<ActorID, OwnerData>::new();
         // check owner data is consistent with token data
